@@ -1,0 +1,20 @@
+# ---- Core ----
+langgraph>=0.2          # builds the multi-agent graph (nodes, edges, retry loop)
+sqlglot>=25.0           # parses SQL so we can PROVE a query is a safe SELECT
+pandas>=2.0             # holds query results and does the "why" analysis
+sqlalchemy>=2.0         # one API for MySQL (production) and SQLite (quick test)
+pymysql>=1.1            # the MySQL driver SQLAlchemy uses
+python-dotenv>=1.0      # loads settings from the .env file
+streamlit>=1.50        # the chat UI (1.50+ needed for width="stretch")
+plotly>=5.20            # interactive charts
+# ---- LLM providers (install the one you use) ----
+langchain-google-genai  # Gemini
+langchain-groq          # Groq (Llama models, free tier)
+# ---- RAG (document search) ----
+langchain-community     # FAISS wrapper
+langchain-huggingface   # embedding model wrapper
+sentence-transformers   # the embedding model itself
+faiss-cpu               # vector index
+# ---- Tests ----
+pytest
+pypdf>=4.0              # reads PDF documents for the document Q&A feature
