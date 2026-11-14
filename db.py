@@ -17,6 +17,20 @@ def create_all_tables():
     metadata.create_all(engine)
 
 
+def ensure_seeded():
+    """Demo convenience (SQLite only): if the demo database is missing or empty, build it with fake data.
+    Real MySQL databases are never touched: seeding deletes data, so it is only done for the SQLite demo."""
+    if DIALECT != "sqlite":
+        return
+    ready = inspect(engine).has_table("regions")
+    if ready:
+        with engine.connect() as conn:
+            ready = (conn.execute(text("SELECT COUNT(*) FROM regions")).scalar() or 0) > 0
+    if not ready:
+        import seed                                         # imported here to avoid a circular import
+        seed.main()
+
+
 def allowed_tables(role: str) -> list[str]:
     """Which tables may this role query? Read from the role_table_access table."""
     with engine.connect() as conn:                          # open a connection, auto-close afterwards

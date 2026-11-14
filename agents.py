@@ -3,6 +3,8 @@
 Flow:
  supervisor -> schema -> sql -> validate -> execute -> critic -> [analysis -> rag] -> report
  Document questions: supervisor -> rag -> doc_answer (no SQL)
+ Chat / "explain the data": supervisor -> guide (no SQL, no LLM)
+ Unclear or failed questions: ... -> clarify (guesses what you meant, suggests questions, asks what next)
                           ^________________ retry (max 2) ______________|
 Each function below is one "agent" (a node). It receives the shared State dict and returns
 only the keys it changes.
@@ -10,18 +12,25 @@ only the keys it changes.
 import re
 from typing import TypedDict, Any
 import pandas as pd
-from langgraph.graph import StateGraph, START, END
-import config, db, llm, rag
+try:
+    from langgraph.graph import StateGraph, START, END      # the real LangGraph
+    GRAPH_ENGINE = "langgraph"
+except Exception:                                           # e.g. Windows Application Control blocks ormsgpack's DLL
+    from minigraph import StateGraph, START, END            # tiny built-in runner with the same interface
+    GRAPH_ENGINE = "built-in fallback (LangGraph unavailable)"
+import config, db, llm, rag, catalog
 from guardrails import validate_sql
 from examples import EXAMPLES, WHY_EXAMPLE
 
 
 class State(TypedDict, total=False):                        # the shared notebook every agent reads/writes
-    question: str; role: str; source: str; mode: str        # input + user's source choice + route (lookup/why/docs)
+    question: str; role: str; source: str; mode: str        # input + user's source choice + route (lookup/why/docs/guide/clarify)
+    history: list; suggestions: list                        # earlier turns (for follow-ups) + 'what next?' questions
     tables: list; schema_text: str; glossary: str           # what the SQL agent is allowed to see
     sql: str; feedback: str; error: str; retries: int       # SQL + problems + retry counter
     df: Any; analysis: dict; context: list                  # data, why-analysis, document passages
     chart: dict; insight: str; warning: str; trace: list    # final outputs
+    guide: tuple                                            # (kind, argument) when mode == 'guide'
 
 
 def _log(state, msg):
@@ -37,26 +46,35 @@ DATA_WORDS = {"revenue", "sales", "customer", "customers", "order", "orders", "i
               "stock", "inventory", "product", "products", "supplier", "suppliers", "region", "regions",
               "margin", "total", "average", "count", "top", "trend", "monthly", "sold", "profit", "purchase"}
 
+FOLLOWUP = re.compile(r"^\s*(and|also|what about|how about|now|same|only|just|but|for|in|by|per)\b", re.I)   # "and for North?"
+
 def supervisor(state: State):
-    """Pick the path: 'docs' (answer from documents), 'why' (deep analysis) or 'lookup' (simple SQL)."""
+    """Pick the path: guide (chat/explain), docs, why, lookup, or clarify (we don't understand yet)."""
     q = state["question"].lower()
     words = set(re.findall(r"[a-z]+", q))                             # the individual words
     is_why = any(w in q for w in WHY_WORDS)
     source = state.get("source", "auto")                              # the user's choice in the sidebar
-    if source == "documents":                                         # user forced documents
+    guide = catalog.detect_guide_intent(state["question"], state["role"])   # "hi", "what is the data about?", "explain revenue"
+    follow = bool(state.get("history")) and len(q.split()) <= 10 and bool(FOLLOWUP.match(q))
+    extra = {}
+    if guide:                                                         # talking to the copilot: no SQL needed
+        mode = "guide"; extra = {"guide": guide}
+    elif source == "documents":                                       # user forced documents
         mode = "docs"
     elif source == "data":                                            # user forced the database
         mode = "why" if is_why else "lookup"
     elif words & DOC_WORDS and not is_why:                            # e.g. "What does the pricing policy say?"
         mode = "docs"
-    elif words & DATA_WORDS or is_why:                                # numbers questions
+    elif follow:                                                      # "and for North?" continues the last question
+        mode = "why" if is_why else "lookup"
+    elif words & DATA_WORDS or is_why or catalog.mentions_data(state["question"]):   # questions about our numbers
         mode = "why" if is_why else "lookup"
     elif rag.search(state["question"], k=1):                          # no clue words: do the documents know?
         mode = "docs"
-    else:
-        mode = "lookup"
-    return {"mode": mode, "retries": 0, "feedback": "", "error": "", "warning": "",
-            **_log(state, f"Supervisor: classified question as '{mode}'.")}
+    else:                                                             # we do not understand yet: guess and ask
+        mode = "clarify"
+    return {"mode": mode, "retries": 0, "feedback": "", "error": "", "warning": "", "suggestions": [],
+            **extra, **_log(state, f"Supervisor: classified question as '{mode}'.")}
 
 
 # ---------------------------------------------------------------- 2. Schema agent
@@ -86,10 +104,14 @@ def sql_agent(state: State):
         why_rule = ("This is a WHY question. Compare two periods. Return EXACTLY three columns named "
                     "entity, period, value (entity = customer/product/region, period = label, value = number).\n"
                     f"Example:\nQ: {WHY_EXAMPLE['question']}\nSQL: {WHY_EXAMPLE['sql']}\n")
+    convo = ""
+    if state.get("history"):                                          # lets the user say "and for North?"
+        convo = "RECENT CHAT (the new question may refer to it, e.g. 'and for North?'):\n" + "\n".join(
+            f"Q: {h['question']}\nSQL: {h['sql']}" for h in state["history"][-2:]) + "\n\n"
     fix = f"\nYour previous SQL was rejected. Problem: {state['feedback']}\nPrevious SQL: {state.get('sql','')}\n" if state.get("feedback") else ""
     prompt = (f"### TASK: sql\nYou write {db.DIALECT.upper()} SQL. Output ONLY one SELECT statement, no explanation.\n"
               f"SCHEMA:\n{state['schema_text']}\n\nBUSINESS GLOSSARY (always use these formulas):\n{state['glossary']}\n\n"
-              f"EXAMPLES:\n{shots}\n\n{why_rule}{fix}\nQUESTION: {state['question']}")
+              f"EXAMPLES:\n{shots}\n\n{convo}{why_rule}{fix}\nQUESTION: {state['question']}")
     sql = llm.clean_sql(llm.ask(prompt))
     return {"sql": sql, **_log(state, f"SQL agent: wrote query (attempt {state['retries'] + 1}).")}
 
@@ -209,7 +231,8 @@ def report_agent(state: State):
               "If documents give a likely reason, mention it and name the file. Say so if the data is not enough.")
     insight = llm.ask(prompt)
     db.write_audit(state["role"], state["question"], state["sql"], "ok", len(df), state["retries"])
-    return {"insight": insight, "chart": chart, **_log(state, "Report: chart + insight ready.")}
+    return {"insight": insight, "chart": chart, "suggestions": catalog.followups(state["question"], state["sql"], state["role"]),
+            **_log(state, "Report: chart + insight ready.")}
 
 
 # ---------------------------------------------------------------- 10. Document answer agent
@@ -232,24 +255,74 @@ def doc_answer(state: State):
     db.write_audit(state["role"], state["question"], "", status, len(hits), 0)
     return {"insight": insight, "sql": "", "df": pd.DataFrame(), "chart": {"type": "table"},
             "context": hits if status == "ok" else [], "error": "",
+            "suggestions": catalog.suggest_for_question(state["question"], state["role"], 3) + ["What is the data about?"],
             **_log(state, f"Document answer: {status}.")}
+
+
+# ---------------------------------------------------------------- 11. Guide agent (chat, no SQL)
+def guide_agent(state: State):
+    """Answer 'hi', 'what is the data about?', 'explain the customers table', 'what is revenue?' from the catalog."""
+    kind, arg = state["guide"]
+    out = catalog.guide_answer(kind, arg, state["role"])
+    db.write_audit(state["role"], state["question"], "", "guide", len(out["df"]), 0)
+    return {"insight": out["insight"], "df": out["df"], "sql": "", "chart": {"type": "table"}, "context": [],
+            "suggestions": out["suggestions"], "error": "", **_log(state, f"Guide: explained '{kind}' from the data catalog.")}
+
+
+# ---------------------------------------------------------------- 12. Clarify agent (guess, suggest, ask)
+def _restricted_tables(err: str) -> list[str]:
+    """Tables named in a 'Role may not access' error that REALLY exist (so it is a permission issue, not a made-up table)."""
+    if "may not access" not in err:
+        return []
+    named = [t.strip().lower() for t in err.split(":", 1)[-1].rstrip(".").split(",")]
+    real = {t.lower() for t in db.inspect(db.engine).get_table_names()} - db.INTERNAL_TABLES
+    return [t for t in named if t in real]
+
+
+def clarify_agent(state: State):
+    """Instead of failing: say what we understood, offer questions that WILL work, and ask what the user means."""
+    q, role, err = state["question"], state["role"], state.get("error", "")
+    restricted = _restricted_tables(err)
+    if restricted:                                                    # a real table this role may not see
+        insight = (f"Your role (**{role}**) is not allowed to see: {', '.join(restricted)}. "
+                   "That data is restricted, so I can't answer this one. Here is what I can help with:")
+        suggestions = catalog.starter_questions(role, 4)
+    else:
+        matched = catalog.matched_tables(q, role)
+        asks = catalog.clarifying_questions(q, role)
+        suggestions = catalog.suggest_for_question(q, role, 4)
+        guess = (f"It sounds like you are asking about **{', '.join(matched)}**, but I couldn't turn it into a reliable query yet."
+                 if matched else "I'm not sure what you mean yet, because that doesn't match anything in the company data.")
+        insight = (f"{guess}\n\n**To help me get it right, tell me:**\n" + "\n".join(f"- {x}" for x in asks) +
+                   "\n\nOr click one of these questions I can answer right now.")
+        if config.LLM_PROVIDER != "mock":                             # a real LLM can word the guess more naturally
+            hint = llm.ask(f"### TASK: clarify\nQUESTION: {q}\nTABLES I GUESS: {matched}\n"
+                           f"IN THE DATA:\n{catalog.overview(role).to_string(index=False)}\n"
+                           "In 2-3 friendly sentences: say what the user probably wants (best guess) and ask ONE clarifying question. "
+                           "Only mention tables listed above. Do not invent numbers.")
+            if hint:
+                insight = (hint + "\n\n**You can also tell me:**\n" + "\n".join(f"- {x}" for x in asks)
+                           + "\n\nOr click a question below.")
+    db.write_audit(role, q, "", "clarify", 0, state.get("retries", 0))
+    return {"insight": insight, "df": pd.DataFrame(), "sql": "", "chart": {"type": "table"}, "context": [],
+            "suggestions": suggestions + ["What is the data about?"], **_log(state, "Clarify: guessed intent, offered suggestions.")}
 
 
 # ---------------------------------------------------------------- Routing rules (the "edges")
 def _retry_or_report(state, ok_next):
     if state.get("error"):                                            # something went wrong
-        return "retry" if state["retries"] < config.MAX_RETRIES else "report"
+        return "retry" if state["retries"] < config.MAX_RETRIES else "clarify"
     return ok_next
 
 def after_validator(state): return _retry_or_report(state, "executor")
 def after_executor(state):  return _retry_or_report(state, "critic")
 
-def after_supervisor(state): return "rag" if state["mode"] == "docs" else "schema"
+def after_supervisor(state): return {"docs": "rag", "guide": "guide", "clarify": "clarify"}.get(state["mode"], "schema")
 def after_rag(state):        return "doc_answer" if state["mode"] == "docs" else "report"
 
 def after_critic(state):
     if state.get("error"):
-        return "retry" if state["retries"] < config.MAX_RETRIES else "report"
+        return "retry" if state["retries"] < config.MAX_RETRIES else "clarify"
     return "analysis" if state["mode"] == "why" else "report"
 
 
@@ -258,28 +331,30 @@ def build_graph():
     for name, fn in [("supervisor", supervisor), ("schema", schema_agent), ("sql", sql_agent),
                      ("validator", validator), ("executor", executor), ("critic", critic),
                      ("retry", retry), ("analysis", analysis_agent), ("rag", rag_agent), ("report", report_agent),
-                     ("doc_answer", doc_answer)]:
+                     ("doc_answer", doc_answer), ("guide", guide_agent), ("clarify", clarify_agent)]:
         g.add_node(name, fn)                                          # register each agent
     g.add_edge(START, "supervisor")                                   # straight-line edges
-    g.add_conditional_edges("supervisor", after_supervisor, {"rag": "rag", "schema": "schema"})   # docs path skips SQL
+    g.add_conditional_edges("supervisor", after_supervisor, {"rag": "rag", "schema": "schema", "guide": "guide", "clarify": "clarify"})   # docs path skips SQL
     g.add_edge("schema", "sql")
     g.add_edge("sql", "validator")
-    g.add_conditional_edges("validator", after_validator, {"executor": "executor", "retry": "retry", "report": "report"})
-    g.add_conditional_edges("executor", after_executor, {"critic": "critic", "retry": "retry", "report": "report"})
-    g.add_conditional_edges("critic", after_critic, {"analysis": "analysis", "retry": "retry", "report": "report"})
+    g.add_conditional_edges("validator", after_validator, {"executor": "executor", "retry": "retry", "clarify": "clarify"})
+    g.add_conditional_edges("executor", after_executor, {"critic": "critic", "retry": "retry", "clarify": "clarify"})
+    g.add_conditional_edges("critic", after_critic, {"analysis": "analysis", "retry": "retry", "clarify": "clarify", "report": "report"})
     g.add_edge("retry", "sql")                                        # the repair loop
     g.add_edge("analysis", "rag")
     g.add_conditional_edges("rag", after_rag, {"doc_answer": "doc_answer", "report": "report"})
     g.add_edge("doc_answer", END)
+    g.add_edge("guide", END)
+    g.add_edge("clarify", END)
     g.add_edge("report", END)
     return g.compile()
 
 
 _graph = None
 
-def answer(question: str, role: str = "admin", source: str = "auto") -> State:
-    """Public entry point. source = "auto" (let the supervisor decide), "data" or "documents"."""
+def answer(question: str, role: str = "admin", source: str = "auto", history: list | None = None) -> State:
+    """Public entry point. source = "auto", "data" or "documents". history = earlier [{question, sql}] for follow-ups."""
     global _graph
     if _graph is None:
         _graph = build_graph()
-    return _graph.invoke({"question": question, "role": role, "source": source})
+    return _graph.invoke({"question": question, "role": role, "source": source, "history": history or []})
